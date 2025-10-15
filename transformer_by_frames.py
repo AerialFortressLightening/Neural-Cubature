@@ -7,7 +7,7 @@ import argparse
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
-import re  # 新增导入，用于正则表达式解析文件名
+import re
 
 # 注入占位的 layers 模块，防止 equinox 内部 import layers 命中项目业务模块而循环导入
 import types as _types
@@ -17,7 +17,7 @@ if "layers" not in sys.modules:
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.example_libraries import optimizers
+import optax
 
 import equinox as eqx
 import igl
@@ -385,11 +385,30 @@ class TransformerBlock(eqx.Module):
         self.norm2 = eqx.nn.LayerNorm(model_dims)
 
     def __call__(self, x, key=None):
-        attn_out = self.mha(x)
-        x = self.norm1(x + attn_out)
-        y = self.linear2(jax.nn.gelu(self.linear1(x)))
-        return self.norm2(x + y)
+        def _apply_layer_norm(norm, tensor):
+            orig_shape = tensor.shape
+            flat = tensor.reshape(-1, orig_shape[-1])
+            normed = eqx.filter_vmap(norm)(flat)
+            return normed.reshape(orig_shape)
 
+        def apply_linear_with_vmap(linear, tensor):
+            orig_shape = tensor.shape
+            flat = tensor.reshape(-1, orig_shape[-1])
+            transformed = eqx.filter_vmap(linear)(flat)
+            out_dim = transformed.shape[-1]
+            return transformed.reshape(*orig_shape[:-1], out_dim)
+
+        attn_out = self.mha(x)
+        x_res = x + attn_out
+        x_norm = _apply_layer_norm(self.norm1, x_res)
+
+        y = apply_linear_with_vmap(self.linear1, x_norm)
+        y = jax.nn.gelu(y)
+        y = apply_linear_with_vmap(self.linear2, y)
+
+        out = x_norm + y
+        return _apply_layer_norm(self.norm2, out)
+    
 class MultiHeadSelfAttention(eqx.Module):
     proj_q: eqx.nn.Linear
     proj_k: eqx.nn.Linear
@@ -409,18 +428,25 @@ class MultiHeadSelfAttention(eqx.Module):
 
     def __call__(self, x):
         seq_len, batch, embed_dim = x.shape
-        q = self.proj_q(x)
-        k = self.proj_k(x)
-        v = self.proj_v(x)
+
+        def apply_linear(layer, tensor):
+            return jax.vmap(jax.vmap(layer))(tensor)
+
+        q = apply_linear(self.proj_q, x)
+        k = apply_linear(self.proj_k, x)
+        v = apply_linear(self.proj_v, x)
+
         q = jnp.transpose(q.reshape(seq_len, batch, self.num_heads, self.head_dim), (1, 2, 0, 3))
         k = jnp.transpose(k.reshape(seq_len, batch, self.num_heads, self.head_dim), (1, 2, 0, 3))
         v = jnp.transpose(v.reshape(seq_len, batch, self.num_heads, self.head_dim), (1, 2, 0, 3))
+
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
         attn_weights = jax.nn.softmax(attn_logits, axis=-1)
         attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
         attn_output = jnp.transpose(attn_output, (2, 0, 1, 3)).reshape(seq_len, batch, embed_dim)
-        return self.proj_out(attn_output)
+
+        return apply_linear(self.proj_out, attn_output)
 
 class TransformerStack(eqx.Module):
     blocks: tuple[TransformerBlock, ...]
@@ -490,34 +516,28 @@ class Seq2SeqTransformer(eqx.Module):
         # x shape: [B, K_pad, H, per_time_dim]
         
         # 步骤1: 对每个元素的每个时间步应用线性投影
-        # 使用三层 vmap: batch -> elements -> time_steps
         x_proj = jax.vmap(jax.vmap(jax.vmap(self.temporal_input)))(x)
         # x_proj shape: [B, K_pad, H, hidden_dim]
         
-        # 步骤2: 对每个元素独立地应用时间序列 Transformer
-        def encode_single_sequence(seq):
-            """
-            对单个元素的时间序列进行编码
-            seq: [H, hidden_dim]
-            返回: [H, hidden_dim]
-            """
-            # TransformerStack 期望输入为 [seq_len, batch, dim]
-            # 这里 seq_len=H, batch=1
+        # 步骤2: 批量编码所有元素的时间序列
+        B, K, H, D = x_proj.shape
+        x_flat = jnp.reshape(x_proj, (B * K, H, D))
+
+        def encode_sequence(seq):
+            """对单个元素的时间序列进行编码。"""
+            #jax.debug.print("encode_sequence: seq shape={}", seq.shape)
             seq_expanded = jnp.expand_dims(seq, axis=1)  # [H, 1, hidden_dim]
-            encoded = self.temporal_encoder(seq_expanded, key=key)  # [H, 1, hidden_dim]
-            return jnp.squeeze(encoded, axis=1)  # [H, hidden_dim]
+            #jax.debug.print("encode_sequence: seq_expanded shape={}", seq_expanded.shape)
+            encoded = self.temporal_encoder(seq_expanded, key=None)  # [H, 1, hidden_dim]
+            #jax.debug.print("encode_sequence: encoded shape={}", encoded.shape)
+            return jnp.squeeze(encoded, axis=1)
+
+        temp_encoded_flat = jax.vmap(encode_sequence)(x_flat)  # [B*K, H, hidden_dim]
+        temp_encoded = jnp.reshape(temp_encoded_flat, (B, K, H, D))  # [B, K_pad, H, hidden_dim]
         
-        # 对所有样本和元素应用时间编码
-        # 第一层 vmap: 遍历 batch 维度
-        # 第二层 vmap: 遍历 elements 维度
-        temp_encoded = jax.vmap(jax.vmap(encode_single_sequence))(x_proj)
-        # temp_encoded shape: [B, K_pad, H, hidden_dim]
-        
-        # 步骤3: 对时间维度进行池化，得到每个元素的 embedding
         elem_emb = jnp.mean(temp_encoded, axis=2)  # [B, K_pad, hidden_dim]
         
         # 步骤4: 跨元素编码
-        # TransformerStack 期望 [seq_len, batch, dim]，所以交换前两个维度
         encoder_in = jnp.transpose(elem_emb, (1, 0, 2))  # [K_pad, B, hidden_dim]
         encoded = self.encoder(encoder_in, key=key)  # [K_pad, B, hidden_dim]
         encoded = jnp.transpose(encoded, (1, 0, 2))  # [B, K_pad, hidden_dim]
@@ -638,7 +658,7 @@ def train_seq2seq_model(
     feature_extractor, 
     model_params, 
     model_static,
-    update_fun,
+    optimizer,
     opt_state, 
     train_batches,
     num_epochs=100,
@@ -656,26 +676,27 @@ def train_seq2seq_model(
         
         # 计算损失 (使用掩码处理填充)
         def single_loss(pred, target, sample_mask):
-            # 只取有效位置
-            valid_pred = pred[sample_mask]
-            valid_target = target[sample_mask]
-            
-            # 防止空序列
-            valid_count = jnp.sum(sample_mask)
-            valid_pred = jnp.where(valid_count > 0, valid_pred, jnp.ones_like(valid_pred))
-            valid_target = jnp.where(valid_count > 0, valid_target, jnp.ones_like(valid_target))
-            
+            mask_f = sample_mask.astype(jnp.float32)
+            valid_count = jnp.sum(mask_f)
+            safe_count = jnp.maximum(valid_count, 1.0)
+
+            valid_pred = pred * mask_f
+            valid_target = target * mask_f
+
             pred_sum = jnp.sum(valid_pred) + 1e-8
             target_sum = jnp.sum(valid_target) + 1e-8
+
             pred_norm = valid_pred / pred_sum
             target_norm = valid_target / target_sum
-            
-            mse_loss = jnp.mean((pred_norm - target_norm) ** 2)
+
+            diff_sq = ((pred_norm - target_norm) ** 2) * mask_f
+            mse_loss = jnp.sum(diff_sq) / safe_count
+
             l1_reg = 1e-4 * jnp.sum(jnp.abs(valid_pred))
             rel_error = jnp.abs(pred_sum - target_sum) / target_sum
-            
-            # 如果序列为空，返回零损失
-            return jnp.where(valid_count > 0, mse_loss + 0.1 * rel_error + l1_reg, 0.0)
+
+            total = mse_loss + 0.1 * rel_error + l1_reg
+            return jnp.where(valid_count > 0, total, 0.0)
 
         # 对每个样本计算损失
         losses = jax.vmap(single_loss)(pred_weights, targets, mask)
@@ -703,14 +724,17 @@ def train_seq2seq_model(
         ) ** 0.5
         
         max_norm = 1.0
-        if grad_norm > max_norm:
-            grads = jax.tree_util.tree_map(
-                lambda g: g * max_norm / (grad_norm + 1e-8),
-                grads
-            )
+        scale = jnp.where(grad_norm > max_norm, max_norm / (grad_norm + 1e-8), 1.0)
+        grads = jax.tree_util.tree_map(lambda g: g * scale, grads)
+        
+        # if grad_norm > max_norm:
+        #     grads = jax.tree_util.tree_map(
+        #         lambda g: g * max_norm / (grad_norm + 1e-8),
+        #         grads
+        #     )
         
         # 更新参数
-        updates, opt_state = update_fun(grads, opt_state)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
         params = eqx.apply_updates(params, updates)
         
         return params, opt_state, loss, new_memory
@@ -783,7 +807,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=300, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=8, help="批量大小")
     parser.add_argument("--lr", type=float, default=5e-5, help="学习率")
-    parser.add_argument("--history_len", type=int, default=8, help="历史窗口长度")
+    parser.add_argument("--history_len", type=int, default=4, help="历史窗口长度")
     parser.add_argument("--hidden_dim", type=int, default=128, help="隐藏层维度")
     parser.add_argument("--num_layers", type=int, default=4, help="Transformer层数")
     parser.add_argument("--num_heads", type=int, default=4, help="注意力头数")
@@ -847,8 +871,8 @@ def main():
     
     model_params, model_static = eqx.partition(model, eqx.is_array)
     
-    init_fun, update_fun, get_params = optimizers.adam(args.lr)
-    opt_state = init_fun(model_params)
+    optimizer = optax.adam(args.lr)
+    opt_state = optimizer.init(model_params)
     
     print("Starting training...")
     best_params, final_opt_state = train_seq2seq_model(
@@ -856,7 +880,7 @@ def main():
         feature_extractor,
         model_params,
         model_static,
-        update_fun,
+        optimizer,
         opt_state,
         train_batches,
         num_epochs=args.epochs,
