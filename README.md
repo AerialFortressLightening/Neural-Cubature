@@ -1,2 +1,2 @@
 # Neural-Cubature
-RNN Cubature Subset choose 
+Transformer Cubature Subset choose & predict for simulation
