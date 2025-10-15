@@ -544,8 +544,23 @@ class Seq2SeqTransformer(eqx.Module):
         
         # 步骤5: 融合历史信息
         if memory is not None:
-            history_embed = self.history_embedding(memory)  # [B, hidden_dim]
-            decoded = encoded + history_embed[:, None, :]  # [B, K_pad, hidden_dim]
+            memory = jnp.asarray(memory)
+            if memory.ndim == 0:
+                memory = memory.reshape(1, 1)
+            elif memory.ndim == 1:
+                memory = memory[None, :]
+            else:
+                memory = memory.reshape(memory.shape[0], -1)
+            if memory.shape[0] == 0 or memory.shape[1] != D:
+                memory = jnp.zeros((B, D), dtype=encoded.dtype)
+            else:
+                if memory.shape[0] == 1 and B > 1:
+                    memory = jnp.repeat(memory, B, axis=0)
+                elif memory.shape[0] != B:
+                    memory = memory[:B]
+                memory = memory.astype(encoded.dtype)
+            history_embed = eqx.filter_vmap(self.history_embedding)(memory)  # [B, hidden_dim]
+            decoded = encoded + history_embed[:, None, :]
         else:
             decoded = encoded
         
